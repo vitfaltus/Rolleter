@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <vector>
 
 enum motor_states{
   stopped,
@@ -54,14 +55,14 @@ int log_event(const std::string& message){
     return 0;
 }
 
-void send_next_state(const next_state& to_send, , int client_soc){
+void send_next_state(const next_state& to_send, int client_soc){
     std::vector<char> buffer = serialize(to_send);
     int send_code = send(client_soc, buffer.data(), buffer.size(), 0);
     if (send_code < 0){
         log_event("next_state not sent");
     }
     else{
-        log_event("next_state sent with data; id:" + std::to_string(to_send.id) + ", angle:" + std::to_string(to_send.desired_angle));
+        log_event("next_state sent with data; id:" + std::to_string(to_send.device_id) + ", angle:" + std::to_string(to_send.desired_angle));
     }
 }
 
