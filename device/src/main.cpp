@@ -60,6 +60,13 @@ struct state{
   motor_states direction;
 };
 
+struct from_server_state {
+    int device_id;
+    int desired_angle;
+    device_states dev_state;
+    motor_states mot_state;
+};
+
 void Forward();
 void Backward();
 void Stop();
