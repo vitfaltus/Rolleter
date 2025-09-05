@@ -1,20 +1,9 @@
-/*
-the main loop consists of fetch-execute cycle:
-  FETCH PART
-    -state of the next_state struct is set according the user input (in case of the autolight mode, the light setup is exercised)
-    
-  
-  EXECUTE PART
-    -the device executes instructions in the next_state
-    -the execution section also checks all the rules such as max/min angle 
-
-*/
-
 
 #include <Arduino.h>
 #include <AS5600.h>
 #include "Adafruit_VEML7700.h"
-#include <memory> //shared_ptr
+#include <vector>
+#include <map>
 
 #define driv_en D1
 #define driv_ph D2
@@ -24,129 +13,112 @@ the main loop consists of fetch-execute cycle:
 #define Rbutton D9
 #define Lbutton D10
 
-enum motor_states{
+enum motor_state{
   stopped,
-  backwards,
-  forwards
+  forwards,
+  backwards
 };
 
-enum device_states{
+enum device_state{
   idle,
   homing,
   light_movement,
   manual_movement
 };
 
-struct position
-{
-  position(){
-    angle = 0;
-    rotations = 0;
-  }
-  position(int a, int b): angle(a), rotations(b){}
-  bool operator==(const position& other) const{
-    if (angle == other.angle && rotations == other.rotations){
-      return true;
-    }
-    return false;
-  }
-
-  int angle;
-  int rotations;
-};
-
 struct state{
-  position desired_position;
-  motor_states direction;
+  int rotation;
+  motor_state direction;
+  device_state internal_state;
 };
 
-struct from_server_state {
-    int device_id;
-    int desired_angle;
-    device_states dev_state;
-    motor_states mot_state;
-};
+class Device {
+  int current_rotation;
+  std::map<std::string,int> positions;
+  std::string last_home = "night_shut";
+  //sensors
+  AS5600 encoder;
+  Adafruit_VEML7700 veml = Adafruit_VEML7700();
+  void update_current_position();
+  void home();
 
-void Forward();
-void Backward();
-void Stop();
-
-class Device{
-  int device_index;
-  position min_position = position(200,0);
-  position current_position;
-  position max_position = position(345,0);
-  state next_state;
-  device_states device_state = manual_movement;
-  std::shared_ptr<position> last_home_position = std::make_shared<position>(min_position);
-  const int slack_angle = 4;
-  //these values prevent premature actions (since the loop basically runs on the proc. freq.)
-  int home_counter = 10; // if > 10, device is set ot automatic mode(homing)
+  const int slack_angle = 4; //precision of the position
+  //timeout vars
+  int home_counter = 0; // if > 50, device is set ot automatic mode(homing)
   int right_counter = 0; // if > 30, buttons can override automatic movement
-  int left_counter = right_counter; 
-  
+  int left_counter = 0;
+  //endpoints
+  const int min_rotation = 200;
+  const int max_rotation = 345;
+  //motor commands
+  void Forward();
+  void Backward();
+  void Stop();
+
   public:
-    Device() = default;
-    // main logic solver
-    void fetch_next_state();
-    //executes actions according the next state struct
-    void execute_next_state();
-    //sets next_state pos to min/max pos
-    void home();
-    //reads value from AS5600 and calculates current position, saves it to the current position var
-    void update_current_position();
-    //debug func
-    void Serial_next_state(){
-      Serial.print(current_position.angle);
-      Serial.print(" ");
-      Serial.print(next_state.direction);
-      Serial.print(" ");
-      Serial.println(device_state);
-    }
+    Device();
+    int dev_index = 0; //changed by the controller
+    device_state internal_state;
+    state next_state; // desired state
+    void check_buttons();
+    void physical_movement();
+    friend void setup();
+    
 };
 
+//TODO -- network & controll of other devices (multithread)
+class Controller{
+  std::vector<Device> devices;
+  
+  bool check_network();
+  public:
+    int controller_index; //changed by the server
+    void fetch_next_states();
+    void deliver_next_states();
 
-AS5600 encoder;
-Adafruit_VEML7700 veml = Adafruit_VEML7700();
-Device rolleter;
+};
+
+Device dev;
 
 void setup() {
+  Serial.begin(115200);
+  Wire.begin();
   pinMode(driv_en, OUTPUT);
   pinMode(driv_nSleep, OUTPUT);
   pinMode(driv_ph, OUTPUT);
   pinMode(boost_en, OUTPUT);
-  
+
   digitalWrite(boost_en, HIGH);
   digitalWrite(driv_en, HIGH);
 
   pinMode(Rbutton, INPUT);
   pinMode(Lbutton, INPUT);
 
-  Serial.begin(115200);
-  Wire.begin();
-  //waiting for sensors
-  while(!encoder.begin()){
+  while(!dev.encoder.begin()){
     continue;
   }
-  while (!veml.begin()) {
+  while (!dev.veml.begin()) {
     continue;
   }
 }
 
 void loop() {
-  rolleter.update_current_position();
-  rolleter.fetch_next_state();
-  rolleter.execute_next_state();
+  dev.check_buttons();
+  dev.physical_movement();
 }
 
-void Device::fetch_next_state(){
-  
+Device::Device(){
+  positions["night_shut"] = this->max_rotation;
+  positions["day_shut"] = this->min_rotation;
+  positions["straight"] = 290;
+}
+
+void Device::check_buttons(){
   int right_button = digitalRead(Rbutton);
   int left_button = digitalRead(Lbutton);
   if (right_button == HIGH && left_button == HIGH){
-    if (device_state != homing && home_counter > 50){
+    if (next_state.internal_state != homing && home_counter > 50){
       home_counter=0;
-      device_state = homing;
       home();
     }
     else{
@@ -159,8 +131,8 @@ void Device::fetch_next_state(){
     }
     else{
       right_counter = 0;
-      device_state = manual_movement;
-      next_state.desired_position = max_position;
+      next_state.internal_state = manual_movement;
+      next_state.rotation = max_rotation; // needs a bit of work
       next_state.direction = forwards;
     }
     
@@ -171,74 +143,70 @@ void Device::fetch_next_state(){
     }
     else{
       left_counter = 0;
-      device_state = manual_movement;
-      next_state.desired_position = min_position;
+      next_state.internal_state = manual_movement;
+      next_state.rotation = min_rotation;
       next_state.direction = backwards;
     }
   }
-  //the buttons aren't pressed and the device is in device_state is manual controll, change it to idle and dir to stopped
-  else if (device_state == manual_movement){ 
+  //the buttons aren't pressed and the controll is in device_state is manual controll, change it to idle and dir to stopped
+  else if (next_state.internal_state == manual_movement){ 
     right_counter = 0;
     left_counter = 0;
-    device_state = idle;
+    next_state.internal_state = idle;
     next_state.direction = stopped;
-    next_state.desired_position = current_position;
+    next_state.rotation = current_rotation;
   }
-
-
 }
 
-void Device::execute_next_state(){
+void Device::physical_movement(){
+  update_current_position();
   //wheel is at desired position
-  if (abs(current_position.angle-next_state.desired_position.angle) <= slack_angle){
+  if (abs(current_rotation-next_state.rotation) <= slack_angle){
     Stop();
     return;
   }
-  //move the wheel in the next_state direction
-  if (next_state.direction == forwards) {
+  //move the wheel in the next_state direction OR to end point if out of bounds
+  if (next_state.direction == forwards || current_rotation < min_rotation) {
     Forward();
   }
-  else if (next_state.direction == backwards){
+  else if (next_state.direction == backwards || current_rotation > max_rotation){
     Backward();
   }
   else{
     Stop();
   }
-  
-}
-
-void Device::home(){
-  device_state = homing;
-  //set next_state position according to the last homing position
-  if (*last_home_position == min_position){
-    last_home_position  = std::make_shared<position>(max_position);
-    next_state.direction = forwards;
-    next_state.desired_position = max_position;
-  }
-  else{
-    last_home_position  = std::make_shared<position>(min_position);
-    next_state.direction = backwards;
-    next_state.desired_position = min_position;
-  }
 }
 
 void Device::update_current_position(){
-  current_position.angle = map(encoder.readAngle(), 0, 4095, 0 ,359);
+  current_rotation = map(encoder.readAngle(), 0, 4095, 0 ,359);
 }
 
-void Backward(){
+void Device::home(){
+  next_state.internal_state = homing;
+  if (last_home == "night_shut"){
+    last_home = "day_shut";
+    next_state.direction = backwards;
+  }
+  else{
+    last_home = "night_shut";
+    next_state.direction = forwards;
+  }
+  next_state.rotation = positions[last_home];
+}
+
+void Device::Backward(){
   digitalWrite(driv_nSleep,HIGH);
   digitalWrite(driv_ph, LOW);
   digitalWrite(driv_en, HIGH);
 }
 
-void Forward(){
+void Device::Forward(){
   digitalWrite(driv_nSleep,HIGH);
   digitalWrite(driv_ph, HIGH);
   digitalWrite(driv_en, HIGH);
 }
 
-void Stop(){
+void Device::Stop(){
   digitalWrite(driv_nSleep,LOW);
   digitalWrite(driv_ph, LOW);
   digitalWrite(driv_en, LOW);
